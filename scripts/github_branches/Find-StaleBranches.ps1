@@ -1,24 +1,43 @@
 param(
-    [int]$DaysInactive = 3
+    [int]$DaysInactive = 3,
+    
+    [string]$Repo = "FRCTeam360/RainMaker26"
 )
 
-Write-Host "Finding stale branches (inactive for $DaysInactive+ days, 0 commits ahead of main, no active PRs)..." -ForegroundColor Cyan
+Write-Host "Finding stale branches in $Repo (inactive for $DaysInactive+ days, 0 commits ahead of main, no active PRs)..." -ForegroundColor Cyan
 Write-Host ""
+
+# Check if gh CLI is installed
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    Write-Host "Error: GitHub CLI (gh) is not installed." -ForegroundColor Red
+    Write-Host "Install it with: choco install gh" -ForegroundColor Yellow
+    exit 1
+}
 
 # Get current date
 $cutoffDate = (Get-Date).AddDays(-$DaysInactive)
 
 # Get all remote branches except main
-$branches = git branch -r --format='%(refname:short)' | Where-Object { $_ -notmatch 'origin/(main|HEAD)' }
+Write-Host "Fetching branches from $Repo..." -ForegroundColor Yellow
+try {
+    $branchesJson = gh api "repos/$Repo/branches" --paginate 2>&1
+    $branches = $branchesJson | ConvertFrom-Json | Where-Object { $_.name -ne 'main' }
+} catch {
+    Write-Host "Error fetching branches: $_" -ForegroundColor Red
+    exit 1
+}
 
 $staleBranches = @()
 
 foreach ($branch in $branches) {
-    $branchName = $branch -replace 'origin/', ''
+    $branchName = $branch.name
     
-    # Get last commit date
-    $lastCommitDate = git log -1 --format='%ci' $branch 2>$null
-    if (-not $lastCommitDate) {
+    # Get last commit date from the branch object
+    try {
+        $commitInfo = gh api "repos/$Repo/commits/$($branch.commit.sha)" 2>&1 | ConvertFrom-Json
+        $lastCommitDate = $commitInfo.commit.author.date
+    } catch {
+        Write-Host "Warning: Could not fetch commit info for $branchName" -ForegroundColor Yellow
         continue
     }
     
@@ -30,13 +49,20 @@ foreach ($branch in $branches) {
     }
     
     # Check if 0 commits ahead of main
-    $aheadCount = git rev-list --count origin/main..$branch 2>$null
-    if ($aheadCount -ne "0") {
+    try {
+        $compareResult = gh api "repos/$Repo/compare/main...$branchName" 2>&1 | ConvertFrom-Json
+        $aheadCount = $compareResult.ahead_by
+    } catch {
+        Write-Host "Warning: Could not compare $branchName with main" -ForegroundColor Yellow
+        continue
+    }
+    
+    if ($aheadCount -ne 0) {
         continue
     }
     
     # Check for PRs
-    $prs = gh pr list --head $branchName --state all --json number,state 2>$null | ConvertFrom-Json
+    $prs = gh pr list --repo $Repo --head $branchName --state all --json number,state 2>$null | ConvertFrom-Json
     
     # Determine PR status
     $mergedPR = $prs | Where-Object { $_.state -eq "MERGED" } | Select-Object -First 1
@@ -76,5 +102,5 @@ $staleBranches | Sort-Object -Property DaysOld -Descending | Format-Table -AutoS
 Write-Host ""
 Write-Host "To archive these branches, run:" -ForegroundColor Cyan
 foreach ($branch in $staleBranches) {
-    Write-Host "  .\Archive-GitBranch.ps1 $($branch.Branch)" -ForegroundColor White
+    Write-Host "  .\Archive-GitBranch.ps1 -BranchName $($branch.Branch) -Repo $Repo" -ForegroundColor White
 }
